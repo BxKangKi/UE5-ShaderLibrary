@@ -1,0 +1,274 @@
+// ShaderLibrary.ush
+#pragma once
+
+// /Plugin/ShaderLibrary/ShaderLibrary.ush
+
+
+float4 UnderWaterShaft(float2 ScreenUV, float3 WorldPos, float3 SunDir, float NumSamples, float Weight, float Exposure, float3 ObjPos)
+{
+    // 1. 해상도 스케일링을 완벽하게 대응하는 UV 좌표
+    // const float2 ScreenUV = GetViewportUV(Parameters);
+    const float2 initialUV = ScreenUV;
+    const float3 L = normalize(-SunDir);
+    const float3 V = ResolvedView.ViewForward;
+    const float3 R = ResolvedView.ViewRight;
+    const float3 U = ResolvedView.ViewUp;
+    const float Time = ResolvedView.GameTime;
+    // 2. LWC 좌표 보정 (카메라 이동 대응)
+    // float3 WorldPos = LWCToFloat(GetWorldPosition(Parameters));
+    const float2 worldSeed = WorldPos.xy * 0.0005f;
+    // 3. 태양 위치 (0.5는 Viewport의 중앙을 의미함)
+    const float forwardDot = dot(V, -L);
+    const float2 sunScreenUV = float2(0.5, 0.5) + float2(dot(R, -L), -dot(U, -L)) * (1.0f / max(forwardDot + 1.0f, 0.5f));
+    // --- 수면 높이 계산부 수정 ---
+    const float3 cameraPos = ResolvedView.TranslatedWorldCameraOrigin;
+    const float3 preViewTranslation = LWCToFloat(ResolvedView.PreViewTranslation);
+    // UE5 LWC 대응: 수면 높이(ObjPos.z)를 카메라 원점 기준의 높이로 변환
+    const float TranslatedWaterZ = ObjPos.z + preViewTranslation.z;
+    const float3 waterPlanePos = float3(cameraPos.xy, TranslatedWaterZ);
+    // [수정] 월드 좌표를 클립 공간으로 보낼 때는 View.WorldToClip을 사용해야 함
+    const float4x4 WorldToClipMatrix = LWCToFloat(ResolvedView.TranslatedWorldToClip);
+    const float4 waterClipPos = mul(float4(waterPlanePos, 1.0f), WorldToClipMatrix);
+    // rayDelta 계산 (분모 0 방지)
+    const float InvNumSamples = 1.0f / max(NumSamples, 1.0f);
+    const float2 rayDelta = (initialUV - sunScreenUV) * InvNumSamples;
+    float2 currentUV = initialUV;
+    float3 accumulatedLight = 0;
+    const float voidDepth = 1000000.0f;
+    const float threshold = voidDepth * 0.9f;
+    const float hash = frac(sin(dot(currentUV, float2(12.9898f, 78.233f))) * 43758.5453f);
+    [loop] for (int i = 0; i < (int)NumSamples; i++)
+    {
+        float2 jitteredUV = currentUV + (rayDelta * (hash - 0.5f));
+        [branch] if (jitteredUV.x < 0 || jitteredUV.x > 1 || jitteredUV.y < 0 || jitteredUV.y > 1)
+        {
+            break;
+        }
+        const float stepProgress = (float)i * InvNumSamples;
+        // [핵심 수정] distortedUV를 그대로 쓰지 않고, 뷰포트 스케일이 반영된 버퍼 좌표로 변환
+        // 13은 SceneDepth, 14는 PostProcessInput0입니다.
+        const float2 depthSampleUV = ViewportUVToSceneTextureUV(jitteredUV, 13);
+        float sceneDepth = SceneTextureLookup(depthSampleUV, 13, false).r;
+        // sceneDepth가 0보다 작거나 같으면 1, 아니면 0
+        float isInvalid = step(sceneDepth, 0.0f);
+        // sceneDepth가 voidDepth보다 크면 1, 아니면 0
+        float isTooFar = step(voidDepth, sceneDepth);
+        // 둘 중 하나라도 해당되면(1.0) voidDepth를 선택하고, 아니면 원래 값을 유지
+        sceneDepth = lerp(sceneDepth, voidDepth, saturate(isInvalid + isTooFar));
+        // 3. 노이즈 계산 (월드 좌표 기반 그룹화 유지)
+        // 카메라가 이동해도 노이즈 패턴이 월드 공간에 고정되도록 이전 답변의 방식을 사용합니다.
+        const float depth = CalcSceneDepth(depthSampleUV);
+        // Screen Space -> Translated World 방향 계산
+        const float2 screenPos = (jitteredUV * 2.0 - 1.0) * float2(1, -1);
+        const float4 hWorldPos = mul(float4(screenPos * depth, depth, 1.0), ResolvedView.ScreenToTranslatedWorld);
+        const float3 worldPosAtPixel = hWorldPos.xyz;
+        // 절대 월드 좌표 계산 (노이즈 고정)
+        const float3 absoluteWorldPos = worldPosAtPixel - preViewTranslation;
+        // 월드 좌표 기반 노이즈 (카메라 이동 시에도 노이즈 위치 고정)
+        // float3 viewRay = mul(float4((jitteredUV * 2 - 1) * float2(1, -1), 1, 1), ResolvedView.ScreenToTranslatedWorld).xyz;
+        // float3 absoluteWorldPos = (ResolvedView.TranslatedWorldCameraOrigin + normalize(viewRay) * 2000.0f) - PreViewTranslation;
+        const float noiseScale = 0.02f;
+        float2 p = absoluteWorldPos.xy * noiseScale; // XY 평면 사용 (태양 앞이므로 수직 평면이 적절)
+        p.x = p.x + Time * 0.9 + 0.3 * sin(p.x) * sin(Time * 7);
+        p.y = p.y - Time * 1.1 - 0.3 * cos(p.y) * cos(Time * 7);
+        // 1. 소수점 및 보간 계수 계산
+        const float2 i_p = floor(p);
+        const float2 f_p = frac(p);
+        const float2 u = f_p * f_p * (3.0f - 2.0f * f_p);
+        // 2. 각 격자점(Grid Point)에 대한 해시값 직접 계산 (디파인 해제)
+        // 좌하단 (0, 0)
+        const float h00 = frac(sin(dot(i_p + float2(0.0f, 0.0f), float2(12.9898f, 78.233f))) * 43758.5453f);
+        // 우하단 (1, 0)
+        const float h10 = frac(sin(dot(i_p + float2(1.0f, 0.0f), float2(12.9898f, 78.233f))) * 43758.5453f);
+        // 좌상단 (0, 1)
+        const float h01 = frac(sin(dot(i_p + float2(0.0f, 1.0f), float2(12.9898f, 78.233f))) * 43758.5453f);
+        // 우상단 (1, 1)
+        const float h11 = frac(sin(dot(i_p + float2(1.0f, 1.0f), float2(12.9898f, 78.233f))) * 43758.5453f);
+        // 3. 선형 보간(Bilinear Interpolation) 진행
+        const float noiseValue = lerp(lerp(h00, h10, u.x), lerp(h01, h11, u.x), u.y);
+        // 오클루젼 판단 (현재 샘플링 지점의 깊이가 지형/캐릭터보다 뒤에 있는지 확인)
+        // 1. 조건 판정을 0 또는 1의 수치로 변환 (sceneDepth > threshold)
+        const float isVisible = step(threshold, sceneDepth);
+        // 2. 조건문을 제거하고 결과값에 마스킹(곱셈) 적용
+        // isVisible이 0이면 전체 결과가 0이 되어 더해지지 않고, 1이면 원래 값이 더해집니다.
+        accumulatedLight += (Weight * exp(-stepProgress * 2.0f) * noiseValue) * isVisible;
+        currentUV -= rayDelta;
+    }
+    const float phase = saturate(forwardDot * 0.1 + 0.9); // 페이즈 조정
+    return float4((accumulatedLight * Exposure * phase) * InvNumSamples, 1.0f);
+}
+
+float NormalToTangent(float3 NormalMap)
+{
+    // Convert from [0,1] to [-1,1]
+    float3 tangentNormal = normalize(NormalMap * 2.0f - 1.0f);
+    return tangentNormal;
+}
+
+
+float2 ParticlePosToScreenUV(float3 World, float3 View, float FlipY)
+{
+    // Assuming World is your input float3 position
+    // Assuming ViewProj is your View * Projection matrix (pre-multiplied on CPU)
+    // Assuming FlipY is a uniform/constant
+
+    const float4 clipPos = mul(float4(World, 1.0f), ViewProj);
+
+    // --- Epsilon-Max Approach (Branchless W-Guard) ---
+    // 1. Get the sign of W (1.0 or -1.0).
+    // 2. Force W to be at least 1e-6 to avoid division by zero or extreme precision loss.
+    const float w = sign(clipPos.w) * max(abs(clipPos.w), 1e-6f);
+
+    // Standard perspective divide to get Normalized Device Coordinates
+    const float3 ndc = clipPos.xyz / w;
+
+    // --- Optimized UV Mapping ---
+    // Combined Scale, Bias, and Y-Flip into a single MAD (Multiply-Add) operation.
+    // The ternary operator for the float2 constant is resolved at compile time if FlipY is a uniform.
+    const float2 uvScale = float2(0.5f, FlipY ? -0.5f : 0.5f);
+    const float2 uvBias = float2(0.5f, FlipY ? 1.0f : 0.0f);
+
+    const float2 uv = ndc.xy * uvScale + uvBias;
+
+    // saturate() is a "free" hardware instruction that clamps 0.0 to 1.0
+    return saturate(uv);
+}
+
+
+float3 WorldToTangent(float3 TangentWS, float3 NormalWS, float3 NormalMap)
+{
+    // Inputs from vertex shader or interpolated per-pixel
+    const TangentWS = normalize(TangentWS); // Tangent vector in world space
+    const NormalWS = normalize(NormalWS);   // Normal vector in world space
+    const float TangentW = 1.0;               // Handedness component
+
+    // Calculate Binormal (bitangent) using cross product and handedness
+    const float3 BinormalWS = normalize(cross(NormalWS, TangentWS) * TangentW);
+
+    // Sampled normal from normal map in tangent space (usually read from texture)
+    const float3 TangentNormal = normalize(NormalMap * 2.0 - 1.0);
+
+    // Transform tangent space normal to world space
+    const float3 WorldNormal = normalize(
+        TangentWS * TangentNormal.x +
+        BinormalWS * TangentNormal.y +
+        NormalWS * TangentNormal.z);
+
+    return WorldNormal;
+    // Use WorldNormal for lighting or other calculations
+}
+
+
+float4 NormalFromBase(float3x3 ColorLRT, float3x3 ColorBC)
+{
+    // 입력:
+    // float3x3 ColorLRT;      // L, R, T 색상 3개 (각 행이 RGB 벡터)
+    // float3x3 ColorBC;      // B, Center, (0,0,0) 3개 RGB 벡터
+    const float3 Weight = float3(0.299, 0.587, 0.114);
+
+    // L, R, T 회색조 계산 (3x3 * 3x1)
+    const float3 heightsLRT = mul(ColorLRT, Weight);
+
+    // B, Center, 빈 행 회색조 계산 (3x3 * 3x1)
+    const float3 heightsBC = mul(ColorBC, Weight);
+
+    // 높이 차이 계산
+    const float dX = heightsLRT[1] - heightsLRT[0]; // R - L
+    const float dY = heightsLRT[2] - heightsBC[0];   // T - B
+
+    // 중앙 높이
+    const float HeightCenter = heightsBC[1];
+
+    // 노멀 벡터 계산
+    // 기존 노멀 계산 코드 후
+    const float normalStrength = 1.0;
+    float3 normal = normalize(float3(-dX * normalStrength, -dY * normalStrength, 1.0));
+
+    // 기본적으로 Z 축을 양수로 유지 (노말 방향이 표면 밖으로 향하도록)
+    normal.z = saturate(normal.z);
+
+    // 노멀 맵은 일반적으로 [0,1] 범위에 매핑
+    const float3 normalMap = normal * 0.5 + 0.5;
+
+    // (보통 언리얼은 RGB 각각 X,Y,Z축으로 사용하므로 그대로 써도 무방)
+    // 만약 필요하면 Y 축을 반전할 수 있음 (normalMap.g = 1 - normalMap.g)
+
+    // 결과 (R = 높이, G, B, A = 노멀)
+    return float4(HeightCenter, normalMap.g, -normalMap.b, normalMap.r);
+
+}
+
+
+float3 MoonUV(float3 viewDir, float3 lightDir, float size, float intensity)
+{
+    const float3 V = normalize(viewDir);
+    const float3 M = normalize(lightDir);
+
+    const float cosA = dot(V, M);
+    const float cosR = cos(size);
+
+    // 1. Branchless Check: If dot product is less than threshold, we exit early or zero out.
+    // However, to keep it lean, we only proceed if there's a chance of hitting the disk.
+    // Using an explicit branch here is actually okay for early-out on a large sky.
+    [branch] if (cosA >= cosR)
+    {
+        // 2. Optimized Orthonormal Basis (Branchless)
+        // Instead of cross(0,1,0), we use a stable method that doesn't flip at the poles.
+        const float sign_z = (M.z >= 0.0f) ? 1.0f : -1.0f;
+        const float a = -1.0f / (sign_z + M.z);
+        const float b = M.x * M.y * a;
+
+        const float3 right = float3(1.0f + sign_z * M.x * M.x * a, sign_z * b, -sign_z * M.x);
+        const float3 upDir = float3(b, sign_z + M.y * M.y * a, -M.y);
+
+        // 3. Projection & Scaling
+        // We can merge the division by sin(size) into the scale factor.
+        // Note: sin(size) is sqrt(1 - cosR^2) which might be cheaper if size is a constant.
+        const const float invS = 1.0f / sqrt(1.0f - cosR * cosR);
+
+        // Project V onto the planes defined by Right and Up
+        // Since V is normalized and Right/Up are orthonormal to M,
+        // dot(V, Right) automatically handles the projection.
+        const float2 diskCoord = float2(dot(V, right), dot(V, upDir)) * invS;
+
+        // 4. Final Disk Check and UV Output
+        // Check if we are inside the circle (dist squared < 1)
+        if (dot(diskCoord, diskCoord) <= 1.0f)
+        {
+            return float3(diskCoord * 0.5f + 0.5f, intensity);
+        }
+    }
+
+    return (float3)0;
+}
+
+float2 StarUV(float3 ViewDir, float3 MoonDir)
+{
+    const float3 V = normalize(ViewDir);
+    const float3 M = normalize(MoonDir);
+
+    // 1. Basis Generation (Same as before)
+    const float s = (M.z >= 0.0f) ? 1.0f : -1.0f;
+    const float a = -1.0f / (s + M.z);
+    const float b = M.x * M.y * a;
+    const float3 east = float3(1.0f + s * M.x * M.x * a, s * b, -s * M.x);
+    const float3 north = float3(b, s + M.y * M.y * a, -M.y);
+
+    // 2. Project ViewDir onto the Moon-plane
+    // We use the raw local X and Y (Orthographic)
+    const float2 localXY = float2(dot(V, east), dot(V, north));
+
+    // 3. The "Anti-Shrink" Correction
+    // Instead of using acos or atan2, we treat the projection as a disk.
+    // To prevent the stars from stretching at the edges,
+    // we use the length of the projection.
+    const float dist = length(localXY);
+
+    // Normalize the XY to get the direction, then scale by a linear factor
+    // This keeps stars the same size regardless of how close they are to M
+    const float2 uv = (dist > 0.001) ? (localXY / dist) * asin(dist) : (float2)0;
+
+    // 4. Final Remap
+    // Scale this by your StarTiling factor
+    return uv * 0.5f + 0.5f;
+}

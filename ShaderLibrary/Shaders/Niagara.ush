@@ -1,0 +1,46 @@
+// Niagara.ush
+#pragma once
+
+// /Plugin/ShaderLibrary/Niagara.ush
+
+float2 WorldToUV(float3 POSITION, float4x4 MATRIX_VAR)
+{
+    float3 toPos = MATRIX_VAR[0].xyz  - POSITION;
+
+    // Ortho half sizes
+    float halfW = MATRIX_VAR[0].w * 0.5;
+    float halfH = (MATRIX_VAR[0].w / MATRIX_VAR[1].w) * 0.5;
+
+    // Project to capture camera's local axes
+    float localX = dot(toPos, MATRIX_VAR[1].xyz);
+    float localY = dot(toPos, MATRIX_VAR[2].xyz);
+
+    // Normalize to [-half, half] => [0,1]
+    float u = 0.5 + (localX / (halfW)) * 0.5;
+    float v = 0.5 + (localY / (halfH)) * 0.5;
+
+    return clamp(float2(1.0 - u, v), 0.0, 1.0); // 텍스쳐 Y-flip 필요 여부에 따라 1-v or v
+}
+
+bool DepthCheck(float4 SAMPLE_DEPTH, float PARTICLE_DEPTH)
+{
+    // Insert the body of the function
+    // here and add any inputs
+    // and outputs by name using
+    // the add pins above.
+    // Currently, complicated branches,
+    // for loops, switches,
+    // etc are not advised.
+    float depth = (SAMPLE_DEPTH.r / 255.0) + (SAMPLE_DEPTH.g / pow(255.0, 2.0)) + (SAMPLE_DEPTH.b / pow(255.0, 3.0));
+    //float depth = SAMPLE_DEPTH.r * 255.0 + SAMPLE_DEPTH.g * 255.0 * 255.0 + SAMPLE_DEPTH.b * 255.0 * 255.0 * 255.0;
+    //float depth = SAMPLE_DEPTH.r * 255 + SAMPLE_DEPTH.g * 255 + SAMPLE_DEPTH.b * 255;
+    //if (depth > 0.0f)
+    if (depth > PARTICLE_DEPTH)
+    {
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}

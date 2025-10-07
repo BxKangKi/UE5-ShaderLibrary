@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.1.4",
+	"FriendlyName": "ShaderLibrary",
+	"Description": "BxKangKi UE5 ShaderLibrary for ease of use",
+	"Category": "Shader",
+	"CreatedBy": "BxKangKi",
+	"CreatedByURL": "https://github.com/BxKangKi",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"Installed": true,
+	"Modules": [
+ 	   {
+    	    "Name": "ShaderLibrary",
+  	      "Type": "Runtime",
+     	   "LoadingPhase": "Default"
+   	 }
+	],
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false
+}
