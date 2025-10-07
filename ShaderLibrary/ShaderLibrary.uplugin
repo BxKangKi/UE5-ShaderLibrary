@@ -1,0 +1,16 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.1.0",
+	"FriendlyName": "ShaderLibrary",
+	"Description": "BxKangKi ShaderLibrary with Shaders by chrisloop packaged as a plugin for ease of use",
+	"Category": "Shader",
+	"CreatedBy": "BxKangKi, chrisloop",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EngineVersion": "5.6",
+	"CanContainContent": true,
+	"Installed": true
+}
