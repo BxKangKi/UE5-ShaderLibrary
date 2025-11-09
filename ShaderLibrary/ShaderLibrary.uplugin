@@ -1,16 +1,19 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "1.1.0",
+	"VersionName": "1.1.1",
 	"FriendlyName": "ShaderLibrary",
-	"Description": "BxKangKi ShaderLibrary with Shaders by chrisloop packaged as a plugin for ease of use",
+	"Description": "BxKangKi UE5 ShaderLibrary for ease of use",
 	"Category": "Shader",
-	"CreatedBy": "BxKangKi, chrisloop",
-	"CreatedByURL": "",
+	"CreatedBy": "BxKangKi",
+	"CreatedByURL": "https://github.com/BxKangKi",
 	"DocsURL": "",
 	"MarketplaceURL": "",
 	"SupportURL": "",
 	"EngineVersion": "5.6",
 	"CanContainContent": true,
-	"Installed": true
+	"Installed": true,
+	"NoCode": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false
 }
