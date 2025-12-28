@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "1.1.1",
+	"VersionName": "1.1.2",
 	"FriendlyName": "ShaderLibrary",
 	"Description": "BxKangKi UE5 ShaderLibrary for ease of use",
 	"Category": "Shader",
@@ -10,7 +10,6 @@
 	"DocsURL": "",
 	"MarketplaceURL": "",
 	"SupportURL": "",
-	"EngineVersion": "5.6",
 	"CanContainContent": true,
 	"Installed": true,
 	"NoCode": true,
