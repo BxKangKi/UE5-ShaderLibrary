@@ -1,0 +1,277 @@
+// ShaderLibrary.ush
+#pragma once
+
+// /Plugin/ShaderLibrary/ShaderLibrary.ush
+
+float4 UnderWaterShaft(FMaterialPixelParameters Parameters, float3 SunDir, float NumSamples, float Weight, float Exposure)
+{
+    // 1. 해상도 스케일링을 완벽하게 대응하는 UV 좌표
+    const float2 ScreenUV = GetViewportUV(Parameters); 
+    const float2 initialUV = ScreenUV;
+
+    const float3 L = normalize(-SunDir);
+    const float3 V = ResolvedView.ViewForward;
+    const float3 R = ResolvedView.ViewRight;
+    const float3 U = ResolvedView.ViewUp;
+    const float Time = ResolvedView.GameTime * 0.6f;
+
+    // 2. LWC 좌표 보정 (카메라 이동 대응)
+    float3 WorldPos = LWCToFloat(GetWorldPosition(Parameters));
+    float2 worldSeed = WorldPos.xy * 0.001f; 
+
+    // 3. 태양 위치 (0.5는 Viewport의 중앙을 의미함)
+    float forwardDot = dot(V, -L);
+    float2 sunScreenUV = float2(0.5, 0.5) + float2(dot(R, -L), -dot(U, -L)) * (1.0f / max(forwardDot + 1.0f, 0.5f));
+
+    // 4. 레이 마칭 파라미터
+    float2 rayDelta = (initialUV - sunScreenUV) / max(NumSamples, 1.0f);
+    float3 accumulatedLight = 0;
+    float2 currentUV = initialUV;
+    const float voidDepth = 1000000.0f;
+    const float threshold = voidDepth * 0.9f;
+
+    // 5. 샘플링 루프
+    for (int i = 0; i < (int)NumSamples; i++)
+    {
+        float stepProgress = (float)i / max(NumSamples, 1.0f);
+        float2 stepSeed = worldSeed + (L.xy * (float)i * (float)i * 0.005f); 
+
+        // [핵심 수정] distortedUV를 그대로 쓰지 않고, 뷰포트 스케일이 반영된 버퍼 좌표로 변환
+        // 13은 SceneDepth, 14는 PostProcessInput0입니다.
+        float2 depthSampleUV = ViewportUVToSceneTextureUV(currentUV, 13);
+        float sceneDepth = SceneTextureLookup(depthSampleUV, 13, false).r;
+
+        if (sceneDepth <= 0.0f || sceneDepth > voidDepth) sceneDepth = voidDepth;
+
+        // 3. 노이즈 계산 (월드 좌표 기반 그룹화 유지)
+        // 카메라가 이동해도 노이즈 패턴이 월드 공간에 고정되도록 이전 답변의 방식을 사용합니다.
+        float3 cameraPos = ResolvedView.TranslatedWorldCameraOrigin;
+        float3 preViewTranslation = ResolvedView.PreViewTranslation.High + ResolvedView.PreViewTranslation.Low;
+        float depth = CalcSceneDepth(depthSampleUV);
+
+        // Screen Space -> Translated World 방향 계산
+        float2 screenPos = (depthSampleUV * 2.0 - 1.0) * float2(1, -1);
+        float4 hWorldPos = mul(float4(screenPos * depth, depth, 1.0), ResolvedView.ScreenToTranslatedWorld);
+        float3 worldPosAtPixel = hWorldPos.xyz;
+
+        // 절대 월드 좌표 계산 (노이즈 고정)
+        float3 absoluteWorldPos = worldPosAtPixel - preViewTranslation;
+
+        // 노이즈 스케일 및 시간 설정 (그룹 크기 조절)
+        float noiseScale = 0.02; // 숫자가 작을수록 그룹이 커짐
+        float2 p = absoluteWorldPos.xy * noiseScale; // XY 평면 사용 (태양 앞이므로 수직 평면이 적절)
+        p.x = p.x + Time * 1.414;
+        p.y = p.y - Time * 1.14;
+
+        // --- Value Noise 알고리즘 (월드 좌표 p 기반) ---
+        float2 i = floor(p); // 속도 조절
+        float2 f = frac(p);
+
+        float a = frac(sin(dot(i, float2(12.9898, 78.233))) * 42);
+        float b = frac(sin(dot(i + float2(1.0, 0.0), float2(12.9898, 78.233))) * 42);
+        float c = frac(sin(dot(i + float2(0.0, 1.0), float2(12.9898, 78.233))) * 42);
+        float d = frac(sin(dot(i + float2(1.0, 1.0), float2(12.9898, 78.233))) * 42);
+
+        float2 u = f * f * (3.0 - 2.0 * f);
+        float noiseValue = lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+
+
+        // 오클루젼 판단 (현재 샘플링 지점의 깊이가 지형/캐릭터보다 뒤에 있는지 확인)
+        if (sceneDepth > threshold)
+        {
+            accumulatedLight += Weight * exp(-stepProgress * 2.0f) * noiseValue;
+        }
+
+        currentUV -= rayDelta;
+        
+        // 화면 경계 이탈 방지
+        if (currentUV.x < 0 || currentUV.x > 1 || currentUV.y < 0 || currentUV.y > 1) break;
+    }
+
+    float phase = saturate(forwardDot * 0.5 + 0.5); // 페이즈 조정
+    return float4((accumulatedLight * Exposure * phase) / NumSamples, 1.0f);
+}
+
+
+float NormalToTangent(float3 NormalMap)
+{
+    // Convert from [0,1] to [-1,1]
+    float3 tangentNormal = normalize(NormalMap * 2.0f - 1.0f);
+    return tangentNormal;
+}
+
+
+float2 ParticlePosToScreenUV(float3 World, float3 View, float FlipY)
+{
+    float4 clipPos = mul(float4(World, 1.0f), View);
+    float w = clipPos;
+    if (abs(w) < 1e-6f) w = (w >= 0.0f) ? 1e-6f : -1e-6f;
+    float3 ndc = clipPos.xyz / w;
+    // optional: if clip.w < 0 => point is behind camera;
+    // still compute uv but you may choose to discard
+    float2 uv = ndc.xy * 0.5f + 0.5f;
+    if (FlipY)
+    {
+        uv.y = 1.0f - uv.y;
+    }
+    // 안전하게 클램프
+    uv = clamp(uv, 0.0f, 1.0f);
+    return uv;
+}
+
+
+float3 WorldToTangent(float3 TangentWS, float3 NormalWS, float3 NormalMap)
+{
+    // Inputs from vertex shader or interpolated per-pixel
+    TangentWS = normalize(TangentWS);   // Tangent vector in world space
+    NormalWS = normalize(NormalWS);     // Normal vector in world space
+    float TangentW = 1.0;                   // Handedness component
+
+    // Calculate Binormal (bitangent) using cross product and handedness
+    float3 BinormalWS = normalize(cross(NormalWS, TangentWS) * TangentW);
+
+    // Sampled normal from normal map in tangent space (usually read from texture)
+    float3 TangentNormal = normalize(NormalMap * 2.0 - 1.0);
+
+    // Transform tangent space normal to world space
+    float3 WorldNormal = normalize(
+        TangentWS * TangentNormal.x +
+        BinormalWS * TangentNormal.y +
+        NormalWS * TangentNormal.z
+    );
+
+    return WorldNormal;
+    // Use WorldNormal for lighting or other calculations
+}
+
+
+float4 NormalFromBase(float3x3 ColorLRT, float3x3 ColorBC)
+{
+    // 입력:
+    // float3x3 ColorLRT;      // L, R, T 색상 3개 (각 행이 RGB 벡터)
+    // float3x3 ColorBC;      // B, Center, (0,0,0) 3개 RGB 벡터
+    float3 Weight = float3(0.299, 0.587, 0.114);
+
+    // L, R, T 회색조 계산 (3x3 * 3x1)
+    float3 heightsLRT = mul(ColorLRT, Weight);
+
+    // B, Center, 빈 행 회색조 계산 (3x3 * 3x1)
+    float3 heightsBC = mul(ColorBC, Weight);
+
+    // 높이 차이 계산
+    float dX = heightsLRT[1] - heightsLRT[0];      // R - L
+    float dY = heightsLRT[2] - heightsBC[0];      // T - B
+
+    // 중앙 높이
+    float HeightCenter = heightsBC[1];
+
+    // 노멀 벡터 계산
+    // 기존 노멀 계산 코드 후
+    float normalStrength = 1.0;
+    float3 normal = normalize(float3(-dX * normalStrength, -dY * normalStrength, 1.0));
+
+    // 기본적으로 Z 축을 양수로 유지 (노말 방향이 표면 밖으로 향하도록)
+    normal.z = saturate(normal.z);
+
+    // 노멀 맵은 일반적으로 [0,1] 범위에 매핑
+    float3 normalMap = normal * 0.5 + 0.5;
+
+    // (보통 언리얼은 RGB 각각 X,Y,Z축으로 사용하므로 그대로 써도 무방)
+    // 만약 필요하면 Y 축을 반전할 수 있음 (normalMap.g = 1 - normalMap.g)
+
+    // 결과 (R = 높이, G, B, A = 노멀)
+    return float4(HeightCenter, normalMap.g, -normalMap.b, normalMap.r);
+
+}
+
+
+float3 MoonUV(float3 viewDir, float3 lightDir, float size, float intensity)
+{
+    float3 V = normalize(viewDir);
+    float3 M = normalize(lightDir);
+
+    float cosA = dot(V, M);
+    float cosR = cos(size);
+
+    if (cosA >= cosR)
+    {
+        // 1. 고정된 기준축 (예: 월드 전방)
+        float3 forward = float3(0, 0, 1);
+
+        // 2. M과 forward가 겹칠 때를 대비한 안전장치 (외적 대신 정교한 처리)
+        // 하지만 하늘 위(Y축)에서 튀는 문제를 피하기 위해
+        // 달의 방향(M)에 수직인 임의의 일관된 축을 생성합니다.
+        float3 right = normalize(cross(float3(0, 1, 0), M));
+
+        // 만약 M이 Y축과 완전히 일치해서 right가 0이 되는 경우를 대비해
+        // 아주 작은 offset을 주거나, 아래와 같이 정밀한 축 생성을 사용합니다.
+        if (length(right) < 0.001)
+        {
+            right = normalize(cross(float3(0, 0, 1), M));
+        }
+
+        float3 upDir = cross(M, right);
+
+        // 3. 투영 (V를 M 평면에 투영)
+        // V에서 M 성분을 제거하여 평면상의 벡터를 구함
+        float3 projection = V - M * cosA;
+
+        // 4. 스케일링 (sin(size)로 나누어 UV 범위 0~1 확보)
+        float s = sin(size);
+        float x = dot(projection, right) / s;
+        float y = dot(projection, upDir) / s;
+
+        // 5. UV 생성 (0.5 중심)
+        float2 diskCoord = float2(x, y);
+        if (dot(diskCoord, diskCoord) <= 1.0)
+        {
+            float2 uv = 0.5 + 0.5 * diskCoord;
+            return float3(uv.x, uv.y, intensity);
+        }
+    }
+    return float3(0.0, 0.0, 0.0);
+}
+
+float2 StarUV(float3 ViewDir, float3 MoonDir)
+{
+    float3 viewDir = normalize(ViewDir);
+    float3 moonDir = normalize(MoonDir);
+
+    // Step 1: Create the moon's local coordinate system
+    float3 up = moonDir;
+    float3 east = normalize(cross(float3(0, 0, 1), up));
+    if (length(east) < 0.0001)
+    {
+        east = normalize(cross(float3(1, 0, 0), up));
+    }
+    float3 north = cross(up, east);
+
+    // Step 2: Transform the viewDir into moon space
+    float3 moonSpaceViewDir;
+    moonSpaceViewDir.x = dot(viewDir, east);
+    moonSpaceViewDir.y = dot(viewDir, north);
+    moonSpaceViewDir.z = dot(viewDir, up);
+
+    // Step 3: Use a cube map projection on the moon-space vector
+    float3 absViewDir = abs(moonSpaceViewDir);
+    float maxAxis = max(max(absViewDir.x, absViewDir.y), absViewDir.z);
+
+    float2 starUV;
+    if (maxAxis == absViewDir.x)
+    {
+        starUV = moonSpaceViewDir.yz / maxAxis;
+    }
+    else if (maxAxis == absViewDir.y)
+    {
+        starUV = moonSpaceViewDir.xz / maxAxis;
+    }
+    else
+    {
+        starUV = moonSpaceViewDir.xy / maxAxis;
+    }
+
+    // Remap UV coordinates from [-1, 1] to [0, 1]
+    starUV = starUV * 0.5 + 0.5;
+
+    return starUV;
+}
