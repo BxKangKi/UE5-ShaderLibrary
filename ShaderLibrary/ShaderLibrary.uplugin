@@ -13,10 +13,10 @@
 	"CanContainContent": true,
 	"Installed": true,
 	"Modules": [
- 	   {
+ 	 {
     	    "Name": "ShaderLibrary",
-  	      "Type": "Runtime",
-     	   "LoadingPhase": "Default"
+  	    "Type": "Runtime",
+     	    "LoadingPhase": "Default"
    	 }
 	],
 	"IsBetaVersion": false,
