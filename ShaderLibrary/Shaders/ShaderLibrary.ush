@@ -4,100 +4,376 @@
 
 // /Plugin/ShaderLibrary/ShaderLibrary.ush
 
-
-float4 UnderWaterShaft(float2 ScreenUV, float3 WorldPos, float3 SunDir, float NumSamples, float Weight, float Exposure, float3 ObjPos)
+float InvLerp(float a, float b, float v)
 {
-    // 1. 해상도 스케일링을 완벽하게 대응하는 UV 좌표
-    // const float2 ScreenUV = GetViewportUV(Parameters);
-    const float2 initialUV = ScreenUV;
-    const float3 L = normalize(-SunDir);
-    const float3 V = ResolvedView.ViewForward;
-    const float3 R = ResolvedView.ViewRight;
-    const float3 U = ResolvedView.ViewUp;
-    const float Time = ResolvedView.GameTime;
-    // 2. LWC 좌표 보정 (카메라 이동 대응)
-    // float3 WorldPos = LWCToFloat(GetWorldPosition(Parameters));
-    const float2 worldSeed = WorldPos.xy * 0.0005f;
-    // 3. 태양 위치 (0.5는 Viewport의 중앙을 의미함)
-    const float forwardDot = dot(V, -L);
-    const float2 sunScreenUV = float2(0.5, 0.5) + float2(dot(R, -L), -dot(U, -L)) * (1.0f / max(forwardDot + 1.0f, 0.5f));
-    // --- 수면 높이 계산부 수정 ---
-    const float3 cameraPos = ResolvedView.TranslatedWorldCameraOrigin;
-    const float3 preViewTranslation = LWCToFloat(ResolvedView.PreViewTranslation);
-    // UE5 LWC 대응: 수면 높이(ObjPos.z)를 카메라 원점 기준의 높이로 변환
-    const float TranslatedWaterZ = ObjPos.z + preViewTranslation.z;
-    const float3 waterPlanePos = float3(cameraPos.xy, TranslatedWaterZ);
-    // [수정] 월드 좌표를 클립 공간으로 보낼 때는 View.WorldToClip을 사용해야 함
-    const float4x4 WorldToClipMatrix = LWCToFloat(ResolvedView.TranslatedWorldToClip);
-    const float4 waterClipPos = mul(float4(waterPlanePos, 1.0f), WorldToClipMatrix);
-    // rayDelta 계산 (분모 0 방지)
-    const float InvNumSamples = 1.0f / max(NumSamples, 1.0f);
-    const float2 rayDelta = (initialUV - sunScreenUV) * InvNumSamples;
-    float2 currentUV = initialUV;
-    float3 accumulatedLight = 0;
-    const float voidDepth = 1000000.0f;
-    const float threshold = voidDepth * 0.9f;
-    const float hash = frac(sin(dot(currentUV, float2(12.9898f, 78.233f))) * 43758.5453f);
-    [loop] for (int i = 0; i < (int)NumSamples; i++)
+    return (v - a) / (b - a);
+}
+
+// -----------------------------------------------------------------------------
+// Underwater light shaft helper functions
+// -----------------------------------------------------------------------------
+
+float UW_Hash21(float2 p)
+{
+    p = frac(p * float2(123.34f, 456.21f));
+    p += dot(p, p + 45.32f);
+    return frac(p.x * p.y);
+}
+
+float UW_ValueNoise(float2 p)
+{
+    float2 ip = floor(p);
+    float2 fp = frac(p);
+
+    float2 u = fp * fp * (3.0f - 2.0f * fp);
+
+    float a = UW_Hash21(ip + float2(0.0f, 0.0f));
+    float b = UW_Hash21(ip + float2(1.0f, 0.0f));
+    float c = UW_Hash21(ip + float2(0.0f, 1.0f));
+    float d = UW_Hash21(ip + float2(1.0f, 1.0f));
+
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+float UW_FBM(float2 p)
+{
+    float v = 0.0f;
+    float a = 0.5f;
+
+    v += a * UW_ValueNoise(p);        p = p * 2.02f + 17.13f; a *= 0.5f;
+    v += a * UW_ValueNoise(p);        p = p * 2.03f + 31.71f; a *= 0.5f;
+    v += a * UW_ValueNoise(p);        p = p * 2.01f + 11.57f; a *= 0.5f;
+    v += a * UW_ValueNoise(p);
+
+    return saturate(v);
+}
+
+float UW_CausticLikePattern(float2 p, float t)
+{
+    // 두 개의 다른 속도/스케일 노이즈를 겹쳐서 수면 굴절 그림자 느낌을 만듭니다.
+    float n1 = UW_FBM(p * 1.15f + float2(t * 0.17f, -t * 0.11f));
+    float n2 = UW_FBM(p * 1.85f + float2(-t * 0.09f, t * 0.13f));
+
+    float lines = 1.0f - abs(n1 - n2) * 2.75f;
+    lines = pow(saturate(lines), 3.25f);
+
+    float broad = UW_FBM(p * 0.35f + float2(t * 0.035f, -t * 0.045f));
+
+    return saturate(0.42f + broad * 0.32f + lines * 1.15f);
+}
+
+float UW_HenyeyGreensteinApprox(float mu, float g)
+{
+    // 물속 미세 입자 산란은 전방 산란이 강한 편이라 g를 0.65~0.80 정도로 둡니다.
+    float gg = g * g;
+    float denom = max(1.0f + gg - 2.0f * g * mu, 0.045f);
+    return (1.0f - gg) / pow(denom, 1.5f);
+}
+
+
+// -----------------------------------------------------------------------------
+// More realistic screen-space underwater shaft
+// -----------------------------------------------------------------------------
+
+float4 UnderWaterShaft(
+    float2 ScreenUV,
+    float3 WorldPos,
+    float3 SunDir,
+    float NumSamples,
+    float Weight,
+    float Exposure,
+    float WaterLevel,
+    float NoiseScale,
+    float RefractionStrength)
+{
+    float3 L = normalize(SunDir);
+
+    float3 V = normalize(ResolvedView.ViewForward);
+    float Time = ResolvedView.GameTime;
+
+    float4x4 WorldToClipMatrix = LWCToFloat(ResolvedView.TranslatedWorldToClip);
+
+    float3 preViewTranslation = LWCToFloat(ResolvedView.PreViewTranslation);
+    float3 cameraPosTS = ResolvedView.TranslatedWorldCameraOrigin;
+    float3 cameraPosWS = cameraPosTS - preViewTranslation;
+
+    // UE 월드 단위가 cm라는 전제. WaterLevel은 absolute world Z라고 가정합니다.
+    float cameraWaterDepth = WaterLevel - cameraPosWS.z;
+    float underwaterMask = smoothstep(5.0f, 150.0f, cameraWaterDepth);
+
+    [branch]
+    if (underwaterMask <= 0.001f)
     {
-        float2 jitteredUV = currentUV + (rayDelta * (hash - 0.5f));
-        [branch] if (jitteredUV.x < 0 || jitteredUV.x > 1 || jitteredUV.y < 0 || jitteredUV.y > 1)
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+
+    // 태양의 화면 위치. SunDir은 "월드에서 태양을 향하는 방향"이라고 가정합니다.
+    float4 sunWorldPos = float4(cameraPosTS + L * 150000000.0f, 1.0f);
+    float4 sunClipPos = mul(sunWorldPos, WorldToClipMatrix);
+
+    float sunClipW = max(abs(sunClipPos.w), 1.0e-4f);
+    float2 sunScreenUV = (sunClipPos.xy / sunClipW) * float2(0.5f, -0.5f) + 0.5f;
+
+    // 태양이 카메라 앞/수면 위/시야 방향에 있을수록 강하게.
+    float sunInFront = smoothstep(-0.02f, 0.08f, sunClipPos.w);
+    float sunAboveWater = smoothstep(0.01f, 0.22f, L.z);
+    float viewSunDot = dot(V, L);
+
+    // 태양 방향을 볼 때 가장 강하지만, 반대 방향에서도 완전히 사라지지 않게 유지.
+    // 실제 물속 부유 입자 산란/수면 caustic shaft는 모든 방향에서 약하게는 보일 수 있음.
+    float viewFacing = lerp(
+        0.38f,
+        1.0f,
+        smoothstep(-0.35f, 0.45f, viewSunDot)
+    );
+
+    // 화면 밖 태양도 어느 정도 허용하되 너무 멀면 줄입니다.
+    float2 sunOff = abs(sunScreenUV - 0.5f);
+    float sunOffAmount = max(sunOff.x, sunOff.y);
+    float offscreenFade = 1.0f - smoothstep(1.25f, 1.50f, sunOffAmount);
+
+    // 화면공간 radial shaft.
+    float sampleCountF = clamp(floor(NumSamples + 0.5f), 1.0f, 96.0f);
+    int sampleCount = (int)sampleCountF;
+    float invSampleCount = rcp(sampleCountF);
+
+    float2 rayDelta = (ScreenUV - sunScreenUV) * invSampleCount;
+
+    // 픽셀별 고정 지터. 샘플 밴딩을 줄입니다.
+    float2 worldSeed = WorldPos.xy * 0.0005f;
+    float jitter = UW_Hash21(ScreenUV * 173.17f + worldSeed + Time * 0.037f);
+
+    float2 currentUV = ScreenUV - rayDelta * jitter;
+
+    float3 accumulatedLight = 0.0f;
+
+    // 프로젝트 far clip에 따라 조정하세요.
+    // 너무 작으면 멀리 있는 지형이 하늘로 판정되고, 너무 크면 shaft가 약해질 수 있습니다.
+    const float FarSceneDepth = 1000000.0f;
+
+    // 수중 색 흡수 계수. R이 가장 빨리 사라지고 B가 가장 오래 남습니다.
+    // 단위는 UE cm 기준으로 튜닝한 값입니다.
+    const float3 WaterAbsorption = float3(0.00155f, 0.00052f, 0.00016f);
+    const float3 WaterScatterTint = float3(0.10f, 0.56f, 1.00f);
+
+    float translatedWaterZ = WaterLevel + preViewTranslation.z;
+
+    [loop]
+    for (int i = 0; i < 100; i++)
+    {
+        [branch]
+        if (i >= sampleCount)
         {
             break;
         }
-        const float stepProgress = (float)i * InvNumSamples;
-        // [핵심 수정] distortedUV를 그대로 쓰지 않고, 뷰포트 스케일이 반영된 버퍼 좌표로 변환
-        // 13은 SceneDepth, 14는 PostProcessInput0입니다.
-        const float2 depthSampleUV = ViewportUVToSceneTextureUV(jitteredUV, 13);
+
+        float stepProgress = ((float)i + jitter) * invSampleCount;
+
+        [branch]
+        if (currentUV.x < 0.0f || currentUV.x > 1.0f || currentUV.y < 0.0f || currentUV.y > 1.0f)
+        {
+            break;
+        }
+
+        // ---------------------------------------------------------------------
+        // 수면 굴절 느낌: sin/cos 대신 노이즈 기반으로 약간 더 자연스럽게 흔듭니다.
+        // ---------------------------------------------------------------------
+        float2 waveP = currentUV * 18.0f + worldSeed * 60.0f;
+
+        float2 waveNoise = float2(
+            UW_ValueNoise(waveP + float2(Time * 0.80f, Time * 0.21f)),
+            UW_ValueNoise(waveP * 1.73f + float2(-Time * 0.35f, Time * 0.64f))
+        ) - 0.5f;
+
+        float refractionAmount = 0.0055f * RefractionStrength;
+        refractionAmount *= lerp(1.0f, 0.35f, stepProgress);
+
+        float2 refractedUV = saturate(currentUV + waveNoise * refractionAmount);
+
+        // ---------------------------------------------------------------------
+        // SceneDepth 기반 occlusion.
+        // 주의: 기존 코드의 13이 CustomDepth 쪽이었다면, 실제 가림용으로는 SceneDepth를 쓰는 편이 맞습니다.
+        // Unreal 기본 MaterialTemplate 계열에서 SceneDepth는 보통 1입니다.
+        // 프로젝트 래퍼가 다르면 여기의 1을 프로젝트의 SceneDepth id로 맞추세요.
+        // ---------------------------------------------------------------------
+        float2 depthSampleUV = ViewportUVToSceneTextureUV(refractedUV, 1);
         float sceneDepth = SceneTextureLookup(depthSampleUV, 13, false).r;
-        // sceneDepth가 0보다 작거나 같으면 1, 아니면 0
-        float isInvalid = step(sceneDepth, 0.0f);
-        // sceneDepth가 voidDepth보다 크면 1, 아니면 0
-        float isTooFar = step(voidDepth, sceneDepth);
-        // 둘 중 하나라도 해당되면(1.0) voidDepth를 선택하고, 아니면 원래 값을 유지
-        sceneDepth = lerp(sceneDepth, voidDepth, saturate(isInvalid + isTooFar));
-        // 3. 노이즈 계산 (월드 좌표 기반 그룹화 유지)
-        // 카메라가 이동해도 노이즈 패턴이 월드 공간에 고정되도록 이전 답변의 방식을 사용합니다.
-        const float depth = CalcSceneDepth(depthSampleUV);
-        // Screen Space -> Translated World 방향 계산
-        const float2 screenPos = (jitteredUV * 2.0 - 1.0) * float2(1, -1);
-        const float4 hWorldPos = mul(float4(screenPos * depth, depth, 1.0), ResolvedView.ScreenToTranslatedWorld);
-        const float3 worldPosAtPixel = hWorldPos.xyz;
-        // 절대 월드 좌표 계산 (노이즈 고정)
-        const float3 absoluteWorldPos = worldPosAtPixel - preViewTranslation;
-        // 월드 좌표 기반 노이즈 (카메라 이동 시에도 노이즈 위치 고정)
-        // float3 viewRay = mul(float4((jitteredUV * 2 - 1) * float2(1, -1), 1, 1), ResolvedView.ScreenToTranslatedWorld).xyz;
-        // float3 absoluteWorldPos = (ResolvedView.TranslatedWorldCameraOrigin + normalize(viewRay) * 2000.0f) - PreViewTranslation;
-        const float noiseScale = 0.02f;
-        float2 p = absoluteWorldPos.xy * noiseScale; // XY 평면 사용 (태양 앞이므로 수직 평면이 적절)
-        p.x = p.x + Time * 0.9 + 0.3 * sin(p.x) * sin(Time * 7);
-        p.y = p.y - Time * 1.1 - 0.3 * cos(p.y) * cos(Time * 7);
-        // 1. 소수점 및 보간 계수 계산
-        const float2 i_p = floor(p);
-        const float2 f_p = frac(p);
-        const float2 u = f_p * f_p * (3.0f - 2.0f * f_p);
-        // 2. 각 격자점(Grid Point)에 대한 해시값 직접 계산 (디파인 해제)
-        // 좌하단 (0, 0)
-        const float h00 = frac(sin(dot(i_p + float2(0.0f, 0.0f), float2(12.9898f, 78.233f))) * 43758.5453f);
-        // 우하단 (1, 0)
-        const float h10 = frac(sin(dot(i_p + float2(1.0f, 0.0f), float2(12.9898f, 78.233f))) * 43758.5453f);
-        // 좌상단 (0, 1)
-        const float h01 = frac(sin(dot(i_p + float2(0.0f, 1.0f), float2(12.9898f, 78.233f))) * 43758.5453f);
-        // 우상단 (1, 1)
-        const float h11 = frac(sin(dot(i_p + float2(1.0f, 1.0f), float2(12.9898f, 78.233f))) * 43758.5453f);
-        // 3. 선형 보간(Bilinear Interpolation) 진행
-        const float noiseValue = lerp(lerp(h00, h10, u.x), lerp(h01, h11, u.x), u.y);
-        // 오클루젼 판단 (현재 샘플링 지점의 깊이가 지형/캐릭터보다 뒤에 있는지 확인)
-        // 1. 조건 판정을 0 또는 1의 수치로 변환 (sceneDepth > threshold)
-        const float isVisible = step(threshold, sceneDepth);
-        // 2. 조건문을 제거하고 결과값에 마스킹(곱셈) 적용
-        // isVisible이 0이면 전체 결과가 0이 되어 더해지지 않고, 1이면 원래 값이 더해집니다.
-        accumulatedLight += (Weight * exp(-stepProgress * 2.0f) * noiseValue) * isVisible;
+
+        float isInvalidDepth = 1.0f - step(1.0f, sceneDepth);
+        float isTooFar = step(FarSceneDepth, sceneDepth);
+        sceneDepth = lerp(sceneDepth, FarSceneDepth, saturate(isInvalidDepth + isTooFar));
+        // 하늘/빈 공간이면 빛이 들어오는 구멍으로 보고, 지형/오브젝트면 빛을 막습니다.
+        float openWaterVisibility = smoothstep(FarSceneDepth * 0.90f, FarSceneDepth * 0.995f, sceneDepth);
+        // SceneDepth는 현재 픽셀뿐 아니라 UV를 넣어 다른 위치의 깊이도 샘플할 수 있으므로,
+        // screen-space radial shaft에서 occlusion mask로 쓰기 좋습니다.
+        // Epic 문서도 SceneDepth가 임의 UV 샘플링을 지원한다고 설명합니다.
+
+        // ---------------------------------------------------------------------
+        // 현재 샘플 방향의 월드 레이 근사.
+        // 실제 3D 볼륨 레이마치가 아니라 포스트 프로세스 근사이므로,
+        // 너무 먼 sky depth는 적당히 cap해서 월드 노이즈가 튀지 않게 합니다.
+        // ---------------------------------------------------------------------
+        float probeDepth = min(sceneDepth, 35000.0f);
+
+        float2 screenPos = (refractedUV * 2.0f - 1.0f) * float2(1.0f, -1.0f);
+        float4 hProbePos = mul(float4(screenPos * probeDepth, probeDepth, 1.0f), ResolvedView.ScreenToTranslatedWorld);
+
+        float invW = rcp(max(abs(hProbePos.w), 1.0e-4f));
+        float3 probePosTS = hProbePos.xyz * invW;
+
+        float3 viewVec = probePosTS - cameraPosTS;
+        float probeLen = max(length(viewVec), 1.0f);
+        float3 viewDir = viewVec / probeLen;
+
+        float3 probePosWS = probePosTS - preViewTranslation;
+        float sampleWaterDepth = max(WaterLevel - probePosWS.z, 0.0f);
+
+        // ---------------------------------------------------------------------
+        // 수면/수중 패턴 위치를 월드에 고정.
+        // 카메라가 움직여도 노이즈가 화면에 붙어 보이지 않게 합니다.
+        // ---------------------------------------------------------------------
+        float canHitSurface = smoothstep(0.02f, 0.12f, viewDir.z);
+        float tToSurface = max((translatedWaterZ - cameraPosTS.z) / max(viewDir.z, 0.04f), 0.0f);
+
+        float3 surfacePosTS = cameraPosTS + viewDir * tToSurface;
+        float3 volumePosTS = cameraPosTS + viewDir * lerp(300.0f, 12000.0f, stepProgress);
+
+        float3 patternPosTS = lerp(volumePosTS, surfacePosTS, canHitSurface);
+        float2 patternPosWS = (patternPosTS - preViewTranslation).xy;
+
+        float noiseScaleSafe = max(NoiseScale, 1.0e-6f);
+        float2 p = patternPosWS * noiseScaleSafe;
+
+        float causticShadow = UW_CausticLikePattern(p + worldSeed * 2.0f, Time);
+        float sliceNoise = UW_FBM(p * 0.37f + float2(Time * 0.035f, -Time * 0.045f) + stepProgress * 2.0f);
+
+        float shaftBreakup = lerp(0.55f, 1.18f, sliceNoise) * causticShadow;
+
+        // ---------------------------------------------------------------------
+        // 물속 산란: 전방 산란 + Beer-Lambert식 색 흡수 근사.
+        // 태양 방향을 바라볼수록 shaft가 더 선명하게 보입니다.
+        // ---------------------------------------------------------------------
+        float mu = dot(viewDir, L);
+        float phase = saturate(0.08f + UW_HenyeyGreensteinApprox(mu, 0.72f) * 0.055f);
+
+        float effectiveDepth = max(cameraWaterDepth, sampleWaterDepth * 0.35f);
+        float verticalSunPath = effectiveDepth / max(L.z, 0.08f);
+
+        float3 spectralTransmittance = exp(-WaterAbsorption * verticalSunPath);
+        float3 scatterColor = WaterScatterTint * spectralTransmittance;
+
+        float distanceFade = exp(-probeLen * 0.000018f);
+        float depthFade = exp(-effectiveDepth * 0.00016f);
+        float radialDecay = exp(-stepProgress * 2.15f);
+
+        float contribution =
+            openWaterVisibility *
+            radialDecay *
+            phase *
+            depthFade *
+            distanceFade *
+            shaftBreakup;
+
+        accumulatedLight += scatterColor * contribution;
+
         currentUV -= rayDelta;
     }
-    const float phase = saturate(forwardDot * 0.1 + 0.9); // 페이즈 조정
-    return float4((accumulatedLight * Exposure * phase) * InvNumSamples, 1.0f);
+
+    float2 toSun = ScreenUV - sunScreenUV;
+    float radialScreenFade = exp(-dot(toSun, toSun) * 0.32f);
+
+    float sunFactor =
+        sunInFront *
+        sunAboveWater *
+        viewFacing *
+        offscreenFade *
+        radialScreenFade;
+
+    float3 finalShaft =
+        accumulatedLight *
+        invSampleCount *
+        Weight *
+        Exposure *
+        underwaterMask *
+        sunFactor;
+
+    return float4(max(finalShaft, 0.0f), 1.0f);
 }
+
+
+
+float4 UnderWaterHazeBlur(
+    float2 ScreenUV,
+    float3 WorldPos,
+    float WaterLevel,
+    float BlurStrength,
+    float HazeStrength,
+    float MaxBlurRadius
+)
+{
+    float3 preViewTranslation = LWCToFloat(ResolvedView.PreViewTranslation);
+    float3 cameraPosTS = ResolvedView.TranslatedWorldCameraOrigin;
+    float3 cameraPosWS = cameraPosTS - preViewTranslation;
+
+    float cameraWaterDepth = WaterLevel - cameraPosWS.z;
+    float underwaterMask = smoothstep(5.0f, 150.0f, cameraWaterDepth);
+
+    if (underwaterMask <= 0.001f)
+    {
+        float2 sceneUV = ViewportUVToSceneTextureUV(ScreenUV, 14);
+        return SceneTextureLookup(sceneUV, 14, false);
+    }
+
+    float2 sceneUV = ViewportUVToSceneTextureUV(ScreenUV, 14);
+    float sceneDepth = SceneTextureLookup(ViewportUVToSceneTextureUV(ScreenUV, 1), 13, false).r;
+
+    float depthFactor = saturate(sceneDepth / 18000.0f);
+    depthFactor = pow(depthFactor, 0.65f);
+
+    float waterFog = saturate(cameraWaterDepth / 3500.0f);
+    float blurAmount = underwaterMask * BlurStrength * depthFactor * waterFog;
+
+    float2 texel = ResolvedView.BufferSizeAndInvSize.zw;
+    float radius = MaxBlurRadius * blurAmount;
+
+    float4 col = 0.0f;
+    float total = 0.0f;
+
+    float w0 = 0.22f;
+    col += SceneTextureLookup(sceneUV, 14, false) * w0;
+    total += w0;
+
+    float2 offsets[8] = {
+        float2( 1.0f,  0.0f),
+        float2(-1.0f,  0.0f),
+        float2( 0.0f,  1.0f),
+        float2( 0.0f, -1.0f),
+        float2( 0.707f,  0.707f),
+        float2(-0.707f,  0.707f),
+        float2( 0.707f, -0.707f),
+        float2(-0.707f, -0.707f)
+    };
+
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        float w = 0.0975f;
+        float2 uv = sceneUV + offsets[i] * texel * radius;
+        col += SceneTextureLookup(uv, 14, false) * w;
+        total += w;
+    }
+
+    col /= total;
+
+    float3 hazeTint = float3(0.08f, 0.42f, 0.72f);
+    float hazeAmount = underwaterMask * HazeStrength * depthFactor * waterFog;
+
+    col.rgb = lerp(col.rgb, hazeTint, hazeAmount);
+
+    return col;
+}
+
+
 
 float NormalToTangent(float3 NormalMap)
 {
@@ -159,12 +435,17 @@ float3 WorldToTangent(float3 TangentWS, float3 NormalWS, float3 NormalMap)
     // Use WorldNormal for lighting or other calculations
 }
 
+float3x3 TransformMatrix(float3 X, float3 Y, float3 Z)
+{
+    return float3x3(X.x, Y.x, Z.x, X.y, Y.y, Z.y, X.z, Y.z, Z.z);
+}
 
-float4 NormalFromBase(float3x3 ColorLRT, float3x3 ColorBC)
+float4 NormalFromBase(float3 L, float3 R, float3 T, float3 B, float3 C)
 {
     // 입력:
-    // float3x3 ColorLRT;      // L, R, T 색상 3개 (각 행이 RGB 벡터)
-    // float3x3 ColorBC;      // B, Center, (0,0,0) 3개 RGB 벡터
+    float3x3 ColorLRT = TransformMatrix(L,R,T); // L, R, T 색상 3개 (각 행이 RGB 벡터)
+    float3x3 ColorBC = TransformMatrix(B,C,0);      // B, Center, (0,0,0) 3개 RGB 벡터
+
     const float3 Weight = float3(0.299, 0.587, 0.114);
 
     // L, R, T 회색조 계산 (3x3 * 3x1)
@@ -196,7 +477,6 @@ float4 NormalFromBase(float3x3 ColorLRT, float3x3 ColorBC)
 
     // 결과 (R = 높이, G, B, A = 노멀)
     return float4(HeightCenter, normalMap.g, -normalMap.b, normalMap.r);
-
 }
 
 
@@ -272,4 +552,31 @@ float2 StarUV(float3 ViewDir, float3 MoonDir)
     // 4. Final Remap
     // Scale this by your StarTiling factor
     return uv * 0.5f + 0.5f;
+}
+
+
+float CausticsFadeOut(float Z, float MinZ, float MaxZ, float3 ObjPos)
+{
+    Z = abs(ObjPos.z - Z);
+    return saturate(InvLerp(MaxZ, MinZ, Z)) * saturate(InvLerp(0.0, MinZ, Z));
+}
+
+float2 AltasUV(float GridSize, float Index, float2 UV)
+{
+    float2 CellSize = 1.0 / GridSize;
+
+    float SafeIndex = floor(Index + 0.5);
+
+    float2 Offset;
+    Offset.x = fmod(SafeIndex, GridSize);
+    Offset.y = floor(SafeIndex / GridSize);
+
+    float2 TiledUV = frac(UV);
+
+    float2 Inset = 0.01;
+
+    float2 CellMin = Offset * CellSize + Inset;
+    float2 CellMax = (Offset + 1.0) * CellSize - Inset;
+
+    return lerp(CellMin, CellMax, TiledUV);
 }
